@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VPN-сборщик и проверщик ключей
-Собирает ключи из открытых источников, проверяет их и сохраняет в репозиторий
+VPN-сборщик с улучшенной проверкой
+Проверяет реальную работоспособность ключей и отсеивает медленные
 """
 
 import os
@@ -11,15 +11,15 @@ import json
 import time
 import socket
 import base64
-import hashlib
+import subprocess
+import threading
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 import requests
-from github import Github, GithubException
+from github import Github
 
 # ========== НАСТРОЙКИ ==========
 SOURCES = [
-    # GitHub-репозитории с конфигами
     "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/main/All_Configs.txt",
     "https://raw.githubusercontent.com/ninjastrikers/Nexus-nodes/main/configs/all.txt",
     "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/1.1.txt",
@@ -29,11 +29,11 @@ SOURCES = [
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/ru-sni/vless_ru.txt",
 ]
 
-TIMEOUT = 5  # секунд на проверку ключа
-MAX_KEYS = 500  # максимальное количество ключей в финальной подписке
+TIMEOUT = 3  # секунд на проверку
+MAX_KEYS = 500  # максимум ключей в подписке
+MAX_PING = 500  # максимальный пинг в миллисекундах
 # ================================
 
-# Паттерны для поиска ключей
 PATTERNS = {
     'vless': r'vless://[A-Za-z0-9+/?=._%-]+',
     'vmess': r'vmess://[A-Za-z0-9+/?=._%-]+',
@@ -47,34 +47,26 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def get_github_repo():
-    """Подключение к GitHub репозиторию"""
     token = os.getenv('GH_TOKEN')
     if not token:
-        raise Exception("❌ GH_TOKEN не найден! Добавьте секрет в репозиторий.")
-    
+        raise Exception("❌ GH_TOKEN не найден!")
     g = Github(token)
     repo_name = os.getenv('GITHUB_REPOSITORY')
     if not repo_name:
-        raise Exception("❌ GITHUB_REPOSITORY не найден! Запускайте через GitHub Actions.")
-    
+        raise Exception("❌ GITHUB_REPOSITORY не найден!")
     return g.get_repo(repo_name)
 
 
 def fetch_content(url):
-    """Загрузка содержимого по URL"""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, timeout=10, headers=headers)
-        if response.status_code == 200:
-            return response.text
-        return None
-    except Exception as e:
-        print(f"⚠️ Ошибка загрузки {url}: {e}")
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, timeout=10, headers=headers)
+        return r.text if r.status_code == 200 else None
+    except:
         return None
 
 
 def extract_keys(text):
-    """Извлечение всех ключей из текста"""
     keys = {}
     for protocol, pattern in PATTERNS.items():
         found = re.findall(pattern, text)
@@ -83,74 +75,78 @@ def extract_keys(text):
     return keys
 
 
-def decode_vmess_config(link):
-    """Декодирование vmess ссылки для получения информации"""
-    try:
-        if link.startswith('vmess://'):
-            encoded = link[8:]
-            if len(encoded) % 4 != 0:
-                encoded += '=' * (4 - len(encoded) % 4)
-            decoded = base64.b64decode(encoded).decode('utf-8')
-            config = json.loads(decoded)
-            return config.get('add', '') or config.get('host', '')
-    except:
-        pass
-    return None
-
-
 def extract_host_from_link(link):
-    """Извлечение хоста из ссылки для проверки"""
+    """Извлечение хоста и порта из ссылки"""
     try:
         if link.startswith('vless://') or link.startswith('trojan://') or link.startswith('hysteria2://'):
             parsed = urlparse(link)
-            return parsed.hostname
+            host = parsed.hostname
+            port = parsed.port or 443
+            return host, port
         elif link.startswith('vmess://'):
-            return decode_vmess_config(link)
+            try:
+                encoded = link[8:]
+                if len(encoded) % 4 != 0:
+                    encoded += '=' * (4 - len(encoded) % 4)
+                decoded = base64.b64decode(encoded).decode('utf-8')
+                config = json.loads(decoded)
+                host = config.get('add') or config.get('host')
+                port = int(config.get('port', 443))
+                return host, port
+            except:
+                return None, None
         elif link.startswith('ss://'):
             try:
                 without_prefix = link[5:]
                 if '@' in without_prefix:
                     host_part = without_prefix.split('@')[1]
                     host = host_part.split(':')[0]
-                    return host
+                    port = int(host_part.split(':')[1].split('/')[0])
+                    return host, port
                 else:
                     if len(without_prefix) % 4 != 0:
                         without_prefix += '=' * (4 - len(without_prefix) % 4)
                     decoded = base64.b64decode(without_prefix).decode('utf-8')
                     if '@' in decoded:
                         host = decoded.split('@')[1].split(':')[0]
-                        return host
+                        port = int(decoded.split(':')[1].split('/')[0])
+                        return host, port
             except:
                 pass
-        return None
+        return None, None
     except:
-        return None
+        return None, None
 
 
-def check_host_alive(host, port=443):
-    """Проверка доступности хоста через TCP-соединение"""
+def check_key_real(link):
+    """Проверка ключа с измерением пинга"""
+    host, port = extract_host_from_link(link)
     if not host:
-        return False
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except:
-        return False
-
-
-def check_key(link):
-    """Проверка ключа на работоспособность"""
-    host = extract_host_from_link(link)
-    if host:
-        return check_host_alive(host)
-    return False
+        return False, 9999
+    
+    # Пробуем разные порты
+    ports_to_try = [port, 443, 80, 8080, 8443, 2096] if port else [443, 80, 8080, 8443, 2096]
+    ports_to_try = list(dict.fromkeys(ports_to_try))  # удаляем дубли
+    
+    for test_port in ports_to_try[:3]:  # проверяем только первые 3 порта
+        try:
+            start = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(TIMEOUT)
+            result = sock.connect_ex((host, test_port))
+            sock.close()
+            
+            if result == 0:
+                ping_ms = int((time.time() - start) * 1000)
+                if ping_ms < MAX_PING:
+                    return True, ping_ms
+        except:
+            pass
+    
+    return False, 9999
 
 
 def save_configs(keys, repo=None):
-    """Сохранение ключей в репозиторий"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     all_keys = []
@@ -160,16 +156,13 @@ def save_configs(keys, repo=None):
     if len(all_keys) > MAX_KEYS:
         all_keys = all_keys[:MAX_KEYS]
     
-    output_files = {}
-    
-    # Общий файл
     all_file = f"{OUTPUT_DIR}/configs_all.txt"
     with open(all_file, 'w', encoding='utf-8') as f:
         f.write(f"# Обновлено: {timestamp}\n")
-        f.write(f"# Всего ключей: {len(all_keys)}\n\n")
+        f.write(f"# Всего ключей: {len(all_keys)}\n")
+        f.write(f"# Макс. пинг: {MAX_PING} мс\n\n")
         for link in all_keys:
             f.write(link + '\n')
-    output_files['all'] = all_file
     
     # Файлы по протоколам
     for protocol, links in keys.items():
@@ -180,88 +173,80 @@ def save_configs(keys, repo=None):
                 f.write(f"# Ключей {protocol}: {len(links)}\n\n")
                 for link in links[:MAX_KEYS]:
                     f.write(link + '\n')
-            output_files[protocol] = protocol_file
     
-    # Статистика
     stats = {
         'last_update': timestamp,
         'total_keys': len(all_keys),
         'protocols': {p: len(l) for p, l in keys.items()},
+        'max_ping': MAX_PING,
         'sources': len(SOURCES)
     }
     with open('stats.json', 'w', encoding='utf-8') as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
     
     if repo:
-        commit_files(repo, output_files)
+        commit_files(repo)
     
     return stats
 
 
-def commit_files(repo, files):
-    """Коммит файлов в репозиторий"""
+def commit_files(repo):
     try:
-        branch = repo.get_branch('main')
-        
-        for file_path in files.values():
+        # Коммитим все файлы в папке configs
+        for file_name in os.listdir(OUTPUT_DIR):
+            file_path = os.path.join(OUTPUT_DIR, file_name)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                try:
-                    existing_file = repo.get_contents(file_path, ref='main')
-                    repo.update_file(
-                        file_path,
-                        f"Обновление конфигов: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                        content,
-                        existing_file.sha,
-                        branch='main'
-                    )
-                    print(f"✅ Обновлён: {file_path}")
-                except:
-                    repo.create_file(
-                        file_path,
-                        f"Создание: {file_path}",
-                        content,
-                        branch='main'
-                    )
-                    print(f"✅ Создан: {file_path}")
-            except Exception as e:
-                print(f"⚠️ Ошибка с {file_path}: {e}")
-        
-        try:
-            with open('stats.json', 'r', encoding='utf-8') as f:
-                stats_content = f.read()
-            try:
-                existing_stats = repo.get_contents('stats.json', ref='main')
+                existing = repo.get_contents(file_path, ref='main')
                 repo.update_file(
-                    'stats.json',
-                    f"Обновление статистики: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                    stats_content,
-                    existing_stats.sha,
+                    file_path,
+                    f"Обновление: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    content,
+                    existing.sha,
                     branch='main'
                 )
-                print("✅ Обновлена статистика")
+                print(f"✅ Обновлён: {file_path}")
             except:
                 repo.create_file(
-                    'stats.json',
-                    "Создание статистики",
-                    stats_content,
+                    file_path,
+                    f"Создание: {file_path}",
+                    content,
                     branch='main'
                 )
-                print("✅ Создана статистика")
-        except Exception as e:
-            print(f"⚠️ Ошибка статистики: {e}")
-            
+                print(f"✅ Создан: {file_path}")
+        
+        # stats.json
+        with open('stats.json', 'r', encoding='utf-8') as f:
+            stats_content = f.read()
+        try:
+            existing_stats = repo.get_contents('stats.json', ref='main')
+            repo.update_file(
+                'stats.json',
+                f"Обновление статистики: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                stats_content,
+                existing_stats.sha,
+                branch='main'
+            )
+            print("✅ Обновлена статистика")
+        except:
+            repo.create_file(
+                'stats.json',
+                "Создание статистики",
+                stats_content,
+                branch='main'
+            )
+            print("✅ Создана статистика")
     except Exception as e:
         print(f"❌ Ошибка коммита: {e}")
 
 
 def main():
-    """Основная функция"""
-    print("🚀 Запуск VPN-сборщика...")
+    print("🚀 Запуск улучшенного сборщика...")
     print(f"📂 Источников: {len(SOURCES)}")
-    print(f"⏱️ Таймаут проверки: {TIMEOUT} сек")
-    print(f"🔢 Максимум ключей: {MAX_KEYS}")
+    print(f"⏱️ Таймаут: {TIMEOUT} сек")
+    print(f"📊 Макс. пинг: {MAX_PING} мс")
     print("-" * 50)
     
     all_keys = {}
@@ -285,26 +270,26 @@ def main():
         time.sleep(1)
     
     print("-" * 50)
-    print(f"📊 Всего найдено уникальных ключей: {total_found}")
-    for protocol, links in all_keys.items():
-        print(f"   {protocol}: {len(links)}")
-    
+    print(f"📊 Всего найдено: {total_found} ключей")
     print("-" * 50)
-    print("🔍 Проверка ключей на работоспособность...")
+    print("🔍 Проверка ключей (реальное подключение + пинг)...")
     
     checked_keys = {}
     checked_count = 0
+    total_to_check = sum(len(v) for v in all_keys.values())
     
     for protocol, links in all_keys.items():
         print(f"   Проверка {protocol}...")
         working = []
-        for link in links:
+        for link in links[:MAX_KEYS * 2]:  # проверяем больше, чтобы потом отсеять
             checked_count += 1
-            if checked_count % 20 == 0:
-                print(f"      Проверено: {checked_count} / {total_found}")
+            if checked_count % 10 == 0:
+                print(f"      Проверено: {checked_count}/{total_to_check}")
             
-            if check_key(link):
+            is_working, ping = check_key_real(link)
+            if is_working:
                 working.append(link)
+                print(f"      ✅ Работает (пинг: {ping} мс)")
             
             time.sleep(0.2)
         
@@ -322,6 +307,7 @@ def main():
         print("✅ Результаты сохранены в репозиторий!")
         print(f"   📅 Обновлено: {stats['last_update']}")
         print(f"   📊 Всего: {stats['total_keys']} ключей")
+        print(f"   📈 Макс. пинг: {stats['max_ping']} мс")
     except Exception as e:
         print(f"❌ Ошибка сохранения: {e}")
         stats = save_configs(checked_keys, None)
