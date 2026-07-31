@@ -1,1 +1,1 @@
-# vpn-collectori
+# vpn-collector
