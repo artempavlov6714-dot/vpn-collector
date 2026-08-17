@@ -1,8 +1,8 @@
 {
-  "last_update": "2026-08-16 18:41:42",
-  "total_keys": 47,
+  "last_update": "2026-08-17 01:50:48",
+  "total_keys": 46,
   "protocols": {
-    "vmess": 47
+    "vmess": 46
   },
   "max_ping": 500,
   "sources": 7
